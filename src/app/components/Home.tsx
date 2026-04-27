@@ -37,7 +37,8 @@ export function Home() {
       {/* Hero background image + soft gradient wash */}
       <div
         className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-        style={{ backgroundImage: "url(/tangle-hero-bg.png)" }}
+        style={{ backgroundImage: `url(${import.meta.env.BASE_URL}tangle-hero-bg.png)` }}
+
       />
       <div
         className="absolute inset-0 opacity-85"
