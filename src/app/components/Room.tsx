@@ -62,8 +62,11 @@ const TARGET_IMAGE_BYTES = 220 * 1024;
 const MAX_IMAGE_DIMENSION = 900;
 const DEVICE_PROFILE_KEY = 'tangle-device-profile-v1';
 const ROOM_SYNC_SOURCE = `tab-${Math.random().toString(36).slice(2, 8)}`;
+const ROOM_TABLE = 'tangle_room_created';
 
 const clampPercent = (value: number) => Math.min(100, Math.max(0, Math.round(value)));
+const roomCodeToNumericId = (roomCode: string) => Number.parseInt(roomCode, 36);
+const formatUpdateDate = () => new Date().toISOString().slice(0, 10);
 const makeTransferCode = () =>
   `${Math.random().toString(36).slice(2, 6)}-${Math.random().toString(36).slice(2, 6)}-${Math.random()
     .toString(36)
@@ -208,6 +211,7 @@ export function Room() {
   const [spoilerOverrides, setSpoilerOverrides] = useState<Record<string, boolean>>({});
 
   const activeRoomId = routeRoomId ?? '';
+  const activeRoomNumericId = roomCodeToNumericId(activeRoomId);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -270,7 +274,10 @@ export function Room() {
     ? getChapterFromProgress(selectedBook.progressByUser[profile.id] ?? 0, selectedBook.totalChapters)
     : 0;
 
-  const shareableLink = typeof window === 'undefined' ? '' : `${window.location.origin}/room/${activeRoomId}`;
+  const shareableLink =
+    typeof window === 'undefined'
+      ? ''
+      : `${window.location.origin}${import.meta.env.BASE_URL}#/room/${activeRoomId}`;
 
   const persistRoomLocal = (next: RoomState) => {
     if (!activeRoomId || typeof window === 'undefined') return;
@@ -278,6 +285,24 @@ export function Room() {
       `tangle-room-${activeRoomId}`,
       JSON.stringify({ ...next, roomVersion: 1 })
     );
+  };
+
+  const persistRoomRemote = async (next: RoomState) => {
+    if (!activeRoomId || !Number.isFinite(activeRoomNumericId)) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+
+    const { error } = await client.from(ROOM_TABLE).upsert(
+      {
+        id: activeRoomNumericId,
+        state: next,
+        update_at: formatUpdateDate(),
+      },
+      { onConflict: 'id' }
+    );
+    if (error) {
+      console.error('Failed to persist room state to Supabase:', error.message);
+    }
   };
 
   const buildRoomState = (
@@ -318,54 +343,87 @@ export function Room() {
     const next = updater(current);
     applyRoomState(next);
     persistRoomLocal(next);
+    void persistRoomRemote(next);
     if (shouldBroadcast) broadcastState(next);
   };
 
   useEffect(() => {
     if (!profile || !activeRoomId || typeof window === 'undefined') return;
 
+    let cancelled = false;
     setIsRoomLoaded(false);
-    const key = `tangle-room-${activeRoomId}`;
-    const saved = window.localStorage.getItem(key);
-
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved) as RoomState;
-        const rawBooks = Array.isArray(parsed.books) ? parsed.books : buildDefaultBooks(profile.id);
-        const parsedBooks = rawBooks.map(migrateLegacyProgress);
-        const parsedProfiles = parsed.profiles ?? {};
-        const nextProfiles = {
+    const hydrate = (incoming: RoomState): RoomState => {
+      const rawBooks = Array.isArray(incoming.books) ? incoming.books : buildDefaultBooks(profile.id);
+      const parsedBooks = rawBooks.map(migrateLegacyProgress);
+      const parsedProfiles = incoming.profiles ?? {};
+      return {
+        books: parsedBooks,
+        selectedBookId: incoming.selectedBookId || parsedBooks[0]?.id || 0,
+        creatorId: incoming.creatorId || profile.id,
+        trustMode: incoming.trustMode || 'open',
+        profiles: {
           ...parsedProfiles,
           [profile.id]: { id: profile.id, initials: profile.initials, color: profile.color },
-        };
-        const nextState: RoomState = {
-          books: parsedBooks,
-          selectedBookId: parsed.selectedBookId || parsedBooks[0]?.id || 0,
-          creatorId: parsed.creatorId || profile.id,
-          trustMode: parsed.trustMode || 'open',
-          profiles: nextProfiles,
-        };
-        applyRoomState(nextState);
-        persistRoomLocal(nextState);
-        setIsRoomLoaded(true);
-        return;
-      } catch {
-        // fallback below
-      }
-    }
-
-    const defaultBooks = buildDefaultBooks(profile.id);
-    const initial: RoomState = {
-      books: defaultBooks,
-      selectedBookId: defaultBooks[0]?.id ?? 0,
-      creatorId: profile.id,
-      trustMode: 'open',
-      profiles: { [profile.id]: { id: profile.id, initials: profile.initials, color: profile.color } },
+        },
+      };
     };
-    applyRoomState(initial);
-    persistRoomLocal(initial);
-    setIsRoomLoaded(true);
-  }, [activeRoomId, profile]);
+
+    const loadRoom = async () => {
+      const client = getSupabaseClient();
+      if (client && Number.isFinite(activeRoomNumericId)) {
+        const { data, error } = await client
+          .from(ROOM_TABLE)
+          .select('state')
+          .eq('id', activeRoomNumericId)
+          .maybeSingle();
+
+        if (!cancelled && !error && data?.state) {
+          const nextState = hydrate(data.state as RoomState);
+          applyRoomState(nextState);
+          persistRoomLocal(nextState);
+          setIsRoomLoaded(true);
+          return;
+        }
+      }
+
+      const key = `tangle-room-${activeRoomId}`;
+      const saved = window.localStorage.getItem(key);
+      if (saved) {
+        try {
+          const nextState = hydrate(JSON.parse(saved) as RoomState);
+          if (!cancelled) {
+            applyRoomState(nextState);
+            persistRoomLocal(nextState);
+            setIsRoomLoaded(true);
+          }
+          return;
+        } catch {
+          // fallback to default room state
+        }
+      }
+
+      const defaultBooks = buildDefaultBooks(profile.id);
+      const initial: RoomState = {
+        books: defaultBooks,
+        selectedBookId: defaultBooks[0]?.id ?? 0,
+        creatorId: profile.id,
+        trustMode: 'open',
+        profiles: { [profile.id]: { id: profile.id, initials: profile.initials, color: profile.color } },
+      };
+      if (!cancelled) {
+        applyRoomState(initial);
+        persistRoomLocal(initial);
+        void persistRoomRemote(initial);
+        setIsRoomLoaded(true);
+      }
+    };
+
+    void loadRoom();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRoomId, activeRoomNumericId, profile]);
 
   useEffect(() => {
     if (!activeRoomId || typeof window === 'undefined') return;

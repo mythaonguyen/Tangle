@@ -1,4 +1,4 @@
-import { createBrowserRouter, isRouteErrorResponse, Link, useRouteError } from "react-router";
+import { createHashRouter, isRouteErrorResponse, Link, useRouteError } from "react-router";
 import { Home } from "./components/Home";
 import { Room } from "./components/Room";
 
@@ -24,7 +24,7 @@ function RouteErrorPage() {
   );
 }
 
-export const router = createBrowserRouter(
+export const router = createHashRouter(
   [
     {
       path: "/",
