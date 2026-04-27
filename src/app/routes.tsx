@@ -36,8 +36,5 @@ export const router = createHashRouter(
       Component: Room,
       errorElement: <RouteErrorPage />,
     },
-  ],
-  {
-    basename: import.meta.env.BASE_URL,
-  }
+  ]
 );
