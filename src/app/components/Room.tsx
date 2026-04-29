@@ -1,7 +1,7 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { RealtimeChannel } from '@supabase/supabase-js';
-import { getSupabaseClient } from '../lib/realtime';
+import { getSupabaseClient, isSupabaseConfigured } from '../lib/realtime';
 
 interface Topic {
   id: string;
@@ -87,6 +87,7 @@ const MAX_IMAGE_DIMENSION = 900;
 const DEVICE_PROFILE_KEY = 'tangle-device-profile-v1';
 const ROOM_SYNC_SOURCE = `tab-${Math.random().toString(36).slice(2, 8)}`;
 const ROOM_PROGRESS_TABLE = 'room_progress';
+const ROOM_SNAPSHOTS_TABLE = 'room_snapshots';
 
 const clampPercent = (value: number) => Math.min(100, Math.max(0, Math.round(value)));
 const makeTransferCode = () =>
@@ -195,6 +196,27 @@ const buildDefaultBooks = (ownerId: string): Book[] => [
   },
 ];
 
+const hydrateRoomState = (incoming: RoomState, deviceProfile: DeviceProfile): RoomState => {
+  const rawBooks = Array.isArray(incoming.books) ? incoming.books : buildDefaultBooks(deviceProfile.id);
+  const parsedBooks = rawBooks.map(migrateLegacyProgress);
+  const parsedProfiles = incoming.profiles ?? {};
+  return {
+    books: parsedBooks,
+    selectedBookId: incoming.selectedBookId || parsedBooks[0]?.id || 0,
+    creatorId: incoming.creatorId || deviceProfile.id,
+    trustMode: incoming.trustMode || 'open',
+    profiles: {
+      ...parsedProfiles,
+      [deviceProfile.id]: {
+        id: deviceProfile.id,
+        initials: deviceProfile.initials,
+        color: deviceProfile.color,
+      },
+    },
+    roomVersion: incoming.roomVersion,
+  };
+};
+
 export function Room() {
   const navigate = useNavigate();
   const { roomId: routeRoomId } = useParams();
@@ -202,6 +224,9 @@ export function Room() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const booksRef = useRef<Book[]>([]);
   const profileRef = useRef<DeviceProfile | null>(null);
+  const lastSnapshotTsRef = useRef('');
+  const snapshotDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSnapshotRef = useRef<RoomState | null>(null);
 
   const [profile, setProfile] = useState<DeviceProfile | null>(null);
   const [showProfileForm, setShowProfileForm] = useState(false);
@@ -216,6 +241,7 @@ export function Room() {
   const [trustMode, setTrustMode] = useState<'open' | 'creator_only'>('open');
   const [profilesInRoom, setProfilesInRoom] = useState<Record<string, Pick<DeviceProfile, 'id' | 'initials' | 'color'>>>({});
   const [isRoomLoaded, setIsRoomLoaded] = useState(false);
+  const [supabaseBanner, setSupabaseBanner] = useState('');
 
   const [hoveredBook, setHoveredBook] = useState<number | null>(null);
   const [showBookForm, setShowBookForm] = useState(false);
@@ -238,6 +264,22 @@ export function Room() {
 
   booksRef.current = books;
   profileRef.current = profile;
+
+  useEffect(() => {
+    if (!isSupabaseConfigured()) {
+      setSupabaseBanner('Cloud sync disabled: add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY to your build.');
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (snapshotDebounceRef.current) clearTimeout(snapshotDebounceRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    lastSnapshotTsRef.current = '';
+  }, [activeRoomId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -335,6 +377,38 @@ export function Room() {
     setProfilesInRoom(state.profiles ?? {});
   };
 
+  const flushRoomSnapshot = async () => {
+    const state = pendingSnapshotRef.current;
+    pendingSnapshotRef.current = null;
+    if (!state || !activeRoomId) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+    const updated_at = new Date().toISOString();
+    const { error } = await client.from(ROOM_SNAPSHOTS_TABLE).upsert(
+      { room_id: activeRoomId, state, updated_at },
+      { onConflict: 'room_id' }
+    );
+      if (error) {
+        setSupabaseBanner(
+          `Could not save shared room (create table ${ROOM_SNAPSHOTS_TABLE} — see supabase/room_snapshots.sql): ${error.message}`
+        );
+        return;
+      }
+      setSupabaseBanner('');
+    if (updated_at > (lastSnapshotTsRef.current || '')) {
+      lastSnapshotTsRef.current = updated_at;
+    }
+  };
+
+  const scheduleRoomSnapshot = (state: RoomState) => {
+    pendingSnapshotRef.current = state;
+    if (snapshotDebounceRef.current) clearTimeout(snapshotDebounceRef.current);
+    snapshotDebounceRef.current = setTimeout(() => {
+      snapshotDebounceRef.current = null;
+      void flushRoomSnapshot();
+    }, 450);
+  };
+
   const broadcastState = (state: RoomState) => {
     const payload = { source: ROOM_SYNC_SOURCE, roomId: activeRoomId, state };
     broadcastChannelRef.current?.postMessage(payload);
@@ -351,6 +425,7 @@ export function Room() {
     const next = updater(current);
     applyRoomState(next);
     persistRoomLocal(next);
+    scheduleRoomSnapshot(next);
     if (shouldBroadcast) broadcastState(next);
   };
 
@@ -359,31 +434,63 @@ export function Room() {
 
     let cancelled = false;
     setIsRoomLoaded(false);
-    const hydrate = (incoming: RoomState): RoomState => {
-      const rawBooks = Array.isArray(incoming.books) ? incoming.books : buildDefaultBooks(profile.id);
-      const parsedBooks = rawBooks.map(migrateLegacyProgress);
-      const parsedProfiles = incoming.profiles ?? {};
-      return {
-        books: parsedBooks,
-        selectedBookId: incoming.selectedBookId || parsedBooks[0]?.id || 0,
-        creatorId: incoming.creatorId || profile.id,
-        trustMode: incoming.trustMode || 'open',
-        profiles: {
-          ...parsedProfiles,
-          [profile.id]: { id: profile.id, initials: profile.initials, color: profile.color },
-        },
-      };
+
+    const pushSnapshotIfPossible = async (state: RoomState) => {
+      const client = getSupabaseClient();
+      if (!client) return;
+      const updated_at = new Date().toISOString();
+      const { error } = await client.from(ROOM_SNAPSHOTS_TABLE).upsert(
+        { room_id: activeRoomId, state, updated_at },
+        { onConflict: 'room_id' }
+      );
+      if (error) {
+        setSupabaseBanner(
+          `Shared room table missing or blocked: ${error.message} — run supabase/room_snapshots.sql in Supabase SQL editor.`
+        );
+        return;
+      }
+      setSupabaseBanner('');
+      if (updated_at > (lastSnapshotTsRef.current || '')) {
+        lastSnapshotTsRef.current = updated_at;
+      }
     };
 
     const loadRoom = async () => {
       const key = `tangle-room-${activeRoomId}`;
+      const client = getSupabaseClient();
+
+      if (client) {
+        const { data: snap, error: snapErr } = await client
+          .from(ROOM_SNAPSHOTS_TABLE)
+          .select('state,updated_at')
+          .eq('room_id', activeRoomId)
+          .maybeSingle();
+
+        if (!cancelled && snap?.state && !snapErr) {
+          setSupabaseBanner('');
+          const ts = snap.updated_at ?? '';
+          if (ts) lastSnapshotTsRef.current = ts;
+          const nextState = hydrateRoomState(snap.state as RoomState, profile);
+          applyRoomState(nextState);
+          persistRoomLocal(nextState);
+          setIsRoomLoaded(true);
+          return;
+        }
+        if (snapErr) {
+          setSupabaseBanner(
+            `Could not load shared room: ${snapErr.message} — create ${ROOM_SNAPSHOTS_TABLE} (see supabase/room_snapshots.sql).`
+          );
+        }
+      }
+
       const saved = window.localStorage.getItem(key);
       if (saved) {
         try {
-          const nextState = hydrate(JSON.parse(saved) as RoomState);
+          const nextState = hydrateRoomState(JSON.parse(saved) as RoomState, profile);
           if (!cancelled) {
             applyRoomState(nextState);
             persistRoomLocal(nextState);
+            await pushSnapshotIfPossible(nextState);
             setIsRoomLoaded(true);
           }
           return;
@@ -403,6 +510,7 @@ export function Room() {
       if (!cancelled) {
         applyRoomState(initial);
         persistRoomLocal(initial);
+        await pushSnapshotIfPossible(initial);
         setIsRoomLoaded(true);
       }
     };
@@ -416,7 +524,7 @@ export function Room() {
 
   const applyProgressRows = (baseBooks: Book[], rows: RoomProgressRow[], currentProfile: DeviceProfile | null) =>
     baseBooks.map((book) => {
-      const bookRows = rows.filter((row) => row.book_id === book.id);
+      const bookRows = rows.filter((row) => Number(row.book_id) === book.id);
       if (bookRows.length === 0) return book;
       const nextProgress = { ...book.progressByUser };
       for (const row of bookRows) {
@@ -445,14 +553,23 @@ export function Room() {
         progress: clampPercent(book.progressByUser[profile.id] ?? 0),
         updated_at: now,
       }));
-      let seedResult = await client.from(ROOM_PROGRESS_TABLE).upsert(seedRows, {
-        onConflict: 'room_id,book_id,user_id',
-      });
-      if (seedResult.error && /no unique|ON CONFLICT|42P10/i.test(seedResult.error.message)) {
-        seedResult = await client.from(ROOM_PROGRESS_TABLE).insert(seedRows);
+      let seedHadError = false;
+      for (const row of seedRows) {
+        let r = await client.from(ROOM_PROGRESS_TABLE).upsert(row, {
+          onConflict: 'room_id,book_id,user_id',
+        });
+        if (r.error && /no unique|ON CONFLICT|42P10/i.test(r.error.message)) {
+          r = await client.from(ROOM_PROGRESS_TABLE).insert(row);
+        }
+        if (r.error && r.error.code !== '23505') {
+          seedHadError = true;
+          console.error('room_progress row:', r.error.message, r.error);
+        }
       }
-      if (seedResult.error) {
-        console.error('Failed to seed room_progress:', seedResult.error.message, seedResult.error);
+      if (seedHadError) {
+        setSupabaseBanner((prev) =>
+          prev || 'Some room_progress rows failed (check unique index on room_id, book_id, user_id).'
+        );
       }
 
       if (cancelled) return;
@@ -504,10 +621,33 @@ export function Room() {
     });
     channel.on(
       'postgres_changes',
+      { event: '*', schema: 'public', table: ROOM_SNAPSHOTS_TABLE, filter: `room_id=eq.${activeRoomId}` },
+      (payload) => {
+        const row = payload.new as { state?: RoomState; updated_at?: string } | null;
+        if (!row?.state) return;
+        const ts = row.updated_at ?? '';
+        if (ts && lastSnapshotTsRef.current && ts <= lastSnapshotTsRef.current) return;
+        if (ts) lastSnapshotTsRef.current = ts;
+        pendingSnapshotRef.current = null;
+        if (snapshotDebounceRef.current) {
+          clearTimeout(snapshotDebounceRef.current);
+          snapshotDebounceRef.current = null;
+        }
+        const prof = profileRef.current;
+        if (!prof) return;
+        const nextState = hydrateRoomState(row.state, prof);
+        applyRoomState(nextState);
+        persistRoomLocal(nextState);
+      }
+    );
+    channel.on(
+      'postgres_changes',
       { event: '*', schema: 'public', table: ROOM_PROGRESS_TABLE, filter: `room_id=eq.${activeRoomId}` },
       (payload) => {
         const row = payload.new as Partial<RoomProgressRow> | null;
-        if (!row || typeof row.book_id !== 'number') return;
+        if (!row || row.book_id == null) return;
+        const bid = typeof row.book_id === 'string' ? Number(row.book_id) : row.book_id;
+        if (!Number.isFinite(bid)) return;
         const p = profileRef.current;
         const fullRow = row as RoomProgressRow;
         if (!(fullRow.user_id ?? '').trim()) return;
@@ -515,7 +655,7 @@ export function Room() {
         const progress = clampPercent(Number(row.progress ?? 0));
         setBooks((current) =>
           current.map((book) =>
-            book.id === row.book_id
+            book.id === bid
               ? {
                   ...book,
                   progressByUser: {
@@ -857,6 +997,11 @@ export function Room() {
 
   return (
     <div className="h-screen w-screen flex relative overflow-hidden bg-[#faf8f3]">
+      {supabaseBanner ? (
+        <div className="fixed top-0 left-0 right-0 z-[100] px-3 py-2 bg-amber-100 border-b border-amber-300 text-[11px] sm:text-xs text-amber-950 text-center shadow-sm leading-snug">
+          {supabaseBanner}
+        </div>
+      ) : null}
       <div className="absolute inset-0 pointer-events-none">
         <div
           className="absolute -top-20 -left-20 w-[55%] h-[55%] rounded-full opacity-50"
@@ -872,7 +1017,7 @@ export function Room() {
         />
       </div>
 
-      <div className="relative z-10 flex w-full h-full">
+      <div className={`relative z-10 flex w-full h-full ${supabaseBanner ? 'pt-12' : ''}`}>
         <div className="flex-1 min-w-0 p-5 sm:p-6 pb-28 overflow-hidden">
           <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
             <div className="tangle-glass text-xs sm:text-sm text-[#3d3d3d] rounded-2xl px-3 py-2 max-w-[min(100%,28rem)] leading-snug">
