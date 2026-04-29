@@ -44,6 +44,13 @@ interface RoomState {
   roomVersion?: number;
 }
 
+interface RoomProgressRow {
+  room_id: string;
+  book_id: number;
+  user_id: string;
+  progress: number;
+}
+
 /** Legacy demo seeded 15% for a single reader; normalize to 0% */
 const migrateLegacyProgress = (book: Book): Book => {
   const entries = Object.entries(book.progressByUser);
@@ -62,11 +69,9 @@ const TARGET_IMAGE_BYTES = 220 * 1024;
 const MAX_IMAGE_DIMENSION = 900;
 const DEVICE_PROFILE_KEY = 'tangle-device-profile-v1';
 const ROOM_SYNC_SOURCE = `tab-${Math.random().toString(36).slice(2, 8)}`;
-const ROOM_TABLE = 'tangle_room_created';
+const ROOM_PROGRESS_TABLE = 'room_progress';
 
 const clampPercent = (value: number) => Math.min(100, Math.max(0, Math.round(value)));
-const roomCodeToNumericId = (roomCode: string) => Number.parseInt(roomCode, 36);
-const formatUpdateDate = () => new Date().toISOString().slice(0, 10);
 const makeTransferCode = () =>
   `${Math.random().toString(36).slice(2, 6)}-${Math.random().toString(36).slice(2, 6)}-${Math.random()
     .toString(36)
@@ -211,7 +216,6 @@ export function Room() {
   const [spoilerOverrides, setSpoilerOverrides] = useState<Record<string, boolean>>({});
 
   const activeRoomId = routeRoomId ?? '';
-  const activeRoomNumericId = roomCodeToNumericId(activeRoomId);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -287,24 +291,6 @@ export function Room() {
     );
   };
 
-  const persistRoomRemote = async (next: RoomState) => {
-    if (!activeRoomId || !Number.isFinite(activeRoomNumericId)) return;
-    const client = getSupabaseClient();
-    if (!client) return;
-
-    const { error } = await client.from(ROOM_TABLE).upsert(
-      {
-        id: activeRoomNumericId,
-        state: next,
-        update_at: formatUpdateDate(),
-      },
-      { onConflict: 'id' }
-    );
-    if (error) {
-      console.error('Failed to persist room state to Supabase:', error.message);
-    }
-  };
-
   const buildRoomState = (
     nextBooks: Book[],
     nextSelectedBookId: number,
@@ -343,7 +329,6 @@ export function Room() {
     const next = updater(current);
     applyRoomState(next);
     persistRoomLocal(next);
-    void persistRoomRemote(next);
     if (shouldBroadcast) broadcastState(next);
   };
 
@@ -369,23 +354,6 @@ export function Room() {
     };
 
     const loadRoom = async () => {
-      const client = getSupabaseClient();
-      if (client && Number.isFinite(activeRoomNumericId)) {
-        const { data, error } = await client
-          .from(ROOM_TABLE)
-          .select('state')
-          .eq('id', activeRoomNumericId)
-          .maybeSingle();
-
-        if (!cancelled && !error && data?.state) {
-          const nextState = hydrate(data.state as RoomState);
-          applyRoomState(nextState);
-          persistRoomLocal(nextState);
-          setIsRoomLoaded(true);
-          return;
-        }
-      }
-
       const key = `tangle-room-${activeRoomId}`;
       const saved = window.localStorage.getItem(key);
       if (saved) {
@@ -413,7 +381,6 @@ export function Room() {
       if (!cancelled) {
         applyRoomState(initial);
         persistRoomLocal(initial);
-        void persistRoomRemote(initial);
         setIsRoomLoaded(true);
       }
     };
@@ -423,7 +390,40 @@ export function Room() {
     return () => {
       cancelled = true;
     };
-  }, [activeRoomId, activeRoomNumericId, profile]);
+  }, [activeRoomId, profile]);
+
+  const applyProgressRows = (baseBooks: Book[], rows: RoomProgressRow[]) =>
+    baseBooks.map((book) => {
+      const bookRows = rows.filter((row) => row.book_id === book.id);
+      if (bookRows.length === 0) return book;
+      const nextProgress = { ...book.progressByUser };
+      for (const row of bookRows) {
+        nextProgress[row.user_id] = clampPercent(row.progress);
+      }
+      return { ...book, progressByUser: nextProgress };
+    });
+
+  useEffect(() => {
+    if (!activeRoomId || !isRoomLoaded) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+
+    let cancelled = false;
+    const loadProgress = async () => {
+      const { data, error } = await client
+        .from(ROOM_PROGRESS_TABLE)
+        .select('room_id, book_id, user_id, progress')
+        .eq('room_id', activeRoomId);
+
+      if (cancelled || error || !data) return;
+      setBooks((current) => applyProgressRows(current, data as RoomProgressRow[]));
+    };
+
+    void loadProgress();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRoomId, isRoomLoaded]);
 
   useEffect(() => {
     if (!activeRoomId || typeof window === 'undefined') return;
@@ -453,6 +453,29 @@ export function Room() {
       applyRoomState(data.state);
       persistRoomLocal(data.state);
     });
+    channel.on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: ROOM_PROGRESS_TABLE, filter: `room_id=eq.${activeRoomId}` },
+      (payload) => {
+        const row = payload.new as Partial<RoomProgressRow> | null;
+        if (!row || typeof row.book_id !== 'number' || typeof row.user_id !== 'string') return;
+        const userId = row.user_id;
+        const progress = clampPercent(Number(row.progress ?? 0));
+        setBooks((current) =>
+          current.map((book) =>
+            book.id === row.book_id
+              ? {
+                  ...book,
+                  progressByUser: {
+                    ...book.progressByUser,
+                    [userId]: progress,
+                  },
+                }
+              : book
+          )
+        );
+      }
+    );
     channel.subscribe();
     supabaseChannelRef.current = channel;
 
@@ -463,6 +486,25 @@ export function Room() {
       }
     };
   }, [activeRoomId]);
+
+  const upsertProgressRemote = async (bookId: number, userId: string, progress: number) => {
+    if (!activeRoomId) return;
+    const client = getSupabaseClient();
+    if (!client) return;
+
+    const { error } = await client.from(ROOM_PROGRESS_TABLE).upsert(
+      {
+        room_id: activeRoomId,
+        book_id: bookId,
+        user_id: userId,
+        progress: clampPercent(progress),
+      },
+      { onConflict: 'room_id,book_id,user_id' }
+    );
+    if (error) {
+      console.error('Failed to update room progress:', error.message);
+    }
+  };
 
   const saveProfile = () => {
     if (!profile || typeof window === 'undefined') return;
@@ -580,15 +622,16 @@ export function Room() {
 
   const incrementMyProgress = (bookId: number) => {
     if (!profile) return;
+    const currentBook = books.find((book) => book.id === bookId);
+    const nextProgress = clampPercent((currentBook?.progressByUser[profile.id] ?? 0) + 5);
     commitRoomState((current) => {
       const nextBooks = current.books.map((book) => {
         if (book.id !== bookId) return book;
-        const currentProgress = book.progressByUser[profile.id] ?? 0;
         return {
           ...book,
           progressByUser: {
             ...book.progressByUser,
-            [profile.id]: clampPercent(currentProgress + 5),
+            [profile.id]: nextProgress,
           },
         };
       });
@@ -601,6 +644,7 @@ export function Room() {
         },
       };
     });
+    void upsertProgressRemote(bookId, profile.id, nextProgress);
   };
 
   const openDiscussionForm = (parentId: string | null = null) => {
@@ -804,7 +848,11 @@ export function Room() {
           <div className="h-full overflow-y-auto pr-2">
             <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-5">
               {books.map((book) => {
-                const participants = Object.values(profilesInRoom);
+                const profileParticipants = Object.values(profilesInRoom);
+                const fallbackParticipants = Object.keys(book.progressByUser)
+                  .filter((id) => !profilesInRoom[id])
+                  .map((id) => ({ id, initials: id.slice(0, 2).toUpperCase(), color: '#6b7280' }));
+                const participants = [...profileParticipants, ...fallbackParticipants];
                 const avg =
                   participants.length === 0
                     ? 0
