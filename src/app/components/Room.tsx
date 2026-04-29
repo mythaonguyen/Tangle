@@ -47,9 +47,23 @@ interface RoomState {
 interface RoomProgressRow {
   room_id: string;
   book_id: number;
-  user_id: string;
   progress: number;
+  /** Participant identity in DB (preferred for your schema). */
+  transfer_code?: string;
+  /** Legacy rows if you still have this column. */
+  user_id?: string;
 }
+
+const normalizeTransferCode = (code: string | undefined) => (code ?? '').trim().toUpperCase();
+
+const progressUserKeyFromRow = (row: RoomProgressRow, currentProfile: DeviceProfile | null): string => {
+  if (row.user_id) return row.user_id;
+  const tc = normalizeTransferCode(row.transfer_code);
+  if (currentProfile && tc && tc === normalizeTransferCode(currentProfile.transferCode)) {
+    return currentProfile.id;
+  }
+  return tc ? `tc:${tc}` : '__unknown__';
+};
 
 /** Legacy demo seeded 15% for a single reader; normalize to 0% */
 const migrateLegacyProgress = (book: Book): Book => {
@@ -183,6 +197,8 @@ export function Room() {
   const { roomId: routeRoomId } = useParams();
   const supabaseChannelRef = useRef<RealtimeChannel | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const booksRef = useRef<Book[]>([]);
+  const profileRef = useRef<DeviceProfile | null>(null);
 
   const [profile, setProfile] = useState<DeviceProfile | null>(null);
   const [showProfileForm, setShowProfileForm] = useState(false);
@@ -216,6 +232,9 @@ export function Room() {
   const [spoilerOverrides, setSpoilerOverrides] = useState<Record<string, boolean>>({});
 
   const activeRoomId = routeRoomId ?? '';
+
+  booksRef.current = books;
+  profileRef.current = profile;
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -392,38 +411,60 @@ export function Room() {
     };
   }, [activeRoomId, profile]);
 
-  const applyProgressRows = (baseBooks: Book[], rows: RoomProgressRow[]) =>
+  const applyProgressRows = (baseBooks: Book[], rows: RoomProgressRow[], currentProfile: DeviceProfile | null) =>
     baseBooks.map((book) => {
       const bookRows = rows.filter((row) => row.book_id === book.id);
       if (bookRows.length === 0) return book;
       const nextProgress = { ...book.progressByUser };
       for (const row of bookRows) {
-        nextProgress[row.user_id] = clampPercent(row.progress);
+        const key = progressUserKeyFromRow(row, currentProfile);
+        nextProgress[key] = clampPercent(row.progress);
       }
       return { ...book, progressByUser: nextProgress };
     });
 
   useEffect(() => {
-    if (!activeRoomId || !isRoomLoaded) return;
+    if (!activeRoomId || !isRoomLoaded || !profile) return;
     const client = getSupabaseClient();
     if (!client) return;
 
     let cancelled = false;
-    const loadProgress = async () => {
+    const syncProgressFromSupabase = async () => {
+      const currentBooks = booksRef.current;
+      if (currentBooks.length === 0) return;
+
+      const transferCode = normalizeTransferCode(profile.transferCode);
+      const seedRows = currentBooks.map((book) => ({
+        room_id: activeRoomId,
+        book_id: book.id,
+        transfer_code: transferCode,
+        progress: clampPercent(book.progressByUser[profile.id] ?? 0),
+      }));
+      const { error: seedError } = await client.from(ROOM_PROGRESS_TABLE).upsert(seedRows, {
+        onConflict: 'room_id,book_id,transfer_code',
+      });
+      if (seedError) {
+        console.error('Failed to seed room_progress:', seedError.message);
+      }
+
+      if (cancelled) return;
       const { data, error } = await client
         .from(ROOM_PROGRESS_TABLE)
-        .select('room_id, book_id, user_id, progress')
+        .select('room_id, book_id, progress, transfer_code, user_id')
         .eq('room_id', activeRoomId);
 
-      if (cancelled || error || !data) return;
-      setBooks((current) => applyProgressRows(current, data as RoomProgressRow[]));
+      if (cancelled || error || !data) {
+        if (error) console.error('Failed to load room_progress:', error.message);
+        return;
+      }
+      setBooks((current) => applyProgressRows(current, data as RoomProgressRow[], profile));
     };
 
-    void loadProgress();
+    void syncProgressFromSupabase();
     return () => {
       cancelled = true;
     };
-  }, [activeRoomId, isRoomLoaded]);
+  }, [activeRoomId, isRoomLoaded, profile]);
 
   useEffect(() => {
     if (!activeRoomId || typeof window === 'undefined') return;
@@ -458,8 +499,11 @@ export function Room() {
       { event: '*', schema: 'public', table: ROOM_PROGRESS_TABLE, filter: `room_id=eq.${activeRoomId}` },
       (payload) => {
         const row = payload.new as Partial<RoomProgressRow> | null;
-        if (!row || typeof row.book_id !== 'number' || typeof row.user_id !== 'string') return;
-        const userId = row.user_id;
+        if (!row || typeof row.book_id !== 'number') return;
+        const p = profileRef.current;
+        const fullRow = row as RoomProgressRow;
+        if (!fullRow.user_id && !fullRow.transfer_code) return;
+        const userKey = progressUserKeyFromRow(fullRow, p);
         const progress = clampPercent(Number(row.progress ?? 0));
         setBooks((current) =>
           current.map((book) =>
@@ -468,7 +512,7 @@ export function Room() {
                   ...book,
                   progressByUser: {
                     ...book.progressByUser,
-                    [userId]: progress,
+                    [userKey]: progress,
                   },
                 }
               : book
@@ -487,20 +531,20 @@ export function Room() {
     };
   }, [activeRoomId]);
 
-  const upsertProgressRemote = async (bookId: number, userId: string, progress: number) => {
-    if (!activeRoomId) return;
+  const upsertProgressRemote = async (bookId: number, progress: number) => {
+    if (!activeRoomId || !profile) return;
     const client = getSupabaseClient();
     if (!client) return;
 
-    const { error } = await client.from(ROOM_PROGRESS_TABLE).upsert(
-      {
-        room_id: activeRoomId,
-        book_id: bookId,
-        user_id: userId,
-        progress: clampPercent(progress),
-      },
-      { onConflict: 'room_id,book_id,user_id' }
-    );
+    const row = {
+      room_id: activeRoomId,
+      book_id: bookId,
+      transfer_code: normalizeTransferCode(profile.transferCode),
+      progress: clampPercent(progress),
+    };
+    const { error } = await client.from(ROOM_PROGRESS_TABLE).upsert(row, {
+      onConflict: 'room_id,book_id,transfer_code',
+    });
     if (error) {
       console.error('Failed to update room progress:', error.message);
     }
@@ -596,6 +640,8 @@ export function Room() {
       selectedBookId: newBook.id,
     }));
 
+    void upsertProgressRemote(newBook.id, 0);
+
     setShowBookForm(false);
     setNewBookName('');
     setNewBookAuthor('');
@@ -644,7 +690,7 @@ export function Room() {
         },
       };
     });
-    void upsertProgressRemote(bookId, profile.id, nextProgress);
+    void upsertProgressRemote(bookId, nextProgress);
   };
 
   const openDiscussionForm = (parentId: string | null = null) => {
@@ -851,7 +897,18 @@ export function Room() {
                 const profileParticipants = Object.values(profilesInRoom);
                 const fallbackParticipants = Object.keys(book.progressByUser)
                   .filter((id) => !profilesInRoom[id])
-                  .map((id) => ({ id, initials: id.slice(0, 2).toUpperCase(), color: '#6b7280' }));
+                  .map((id) => {
+                    if (id.startsWith('tc:')) {
+                      const code = id.slice(3);
+                      const compact = code.replace(/[^A-Z0-9]/gi, '');
+                      return {
+                        id,
+                        initials: (compact.slice(0, 2) || '??').toUpperCase(),
+                        color: '#6b7280',
+                      };
+                    }
+                    return { id, initials: id.slice(0, 2).toUpperCase(), color: '#6b7280' };
+                  });
                 const participants = [...profileParticipants, ...fallbackParticipants];
                 const avg =
                   participants.length === 0
