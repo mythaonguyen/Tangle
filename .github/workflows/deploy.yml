@@ -30,11 +30,54 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      # Vite reads env at build time. Either add secrets NEXT_PUBLIC_SUPABASE_*, VITE_SUPABASE_*,
+      # or one secret SUPABASE_SET_UP: JSON {"url":"...","key":"..."} or two lines (URL then key).
+      - name: Resolve Supabase env for Vite
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          SUPABASE_SET_UP: ${{ secrets.SUPABASE_SET_UP }}
+        run: |
+          set -e
+          URL="${NEXT_PUBLIC_SUPABASE_URL:-}"
+          KEY="${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}"
+          if [ -z "$URL" ]; then URL="${VITE_SUPABASE_URL:-}"; fi
+          if [ -z "$KEY" ]; then KEY="${VITE_SUPABASE_ANON_KEY:-}"; fi
+
+          if { [ -z "$URL" ] || [ -z "$KEY" ]; } && [ -n "${SUPABASE_SET_UP:-}" ]; then
+            if echo "$SUPABASE_SET_UP" | jq -e . >/dev/null 2>&1; then
+              URL=$(echo "$SUPABASE_SET_UP" | jq -r '.url // .NEXT_PUBLIC_SUPABASE_URL // empty')
+              KEY=$(echo "$SUPABASE_SET_UP" | jq -r '.key // .anon // .publishable // .NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY // empty')
+            else
+              URL=$(printf '%s\n' "$SUPABASE_SET_UP" | sed -n '1p' | tr -d '\r' | xargs)
+              KEY=$(printf '%s\n' "$SUPABASE_SET_UP" | sed -n '2p' | tr -d '\r' | xargs)
+            fi
+          fi
+
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            echo "::warning::Supabase URL/key missing. Add NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY, or SUPABASE_SET_UP (JSON url/key or two lines)."
+            exit 0
+          fi
+
+          {
+            echo "NEXT_PUBLIC_SUPABASE_URL<<__TANGLE_ENV__"
+            echo "$URL"
+            echo "__TANGLE_ENV__"
+            echo "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY<<__TANGLE_ENV__"
+            echo "$KEY"
+            echo "__TANGLE_ENV__"
+            echo "VITE_SUPABASE_URL<<__TANGLE_ENV__"
+            echo "$URL"
+            echo "__TANGLE_ENV__"
+            echo "VITE_SUPABASE_ANON_KEY<<__TANGLE_ENV__"
+            echo "$KEY"
+            echo "__TANGLE_ENV__"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: npm run build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
