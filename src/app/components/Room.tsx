@@ -48,25 +48,24 @@ interface RoomProgressRow {
   room_id: string;
   book_id: number;
   progress: number;
-  /** Matches Supabase column `user_transfer_code`. */
-  user_transfer_code?: string;
-  /** Older rows / alternate naming. */
-  transfer_code?: string;
-  user_id?: string;
+  /** Text column: we store normalized `profile.transferCode` (your “transfer code”); legacy rows may use device `u-…` id. */
+  user_id: string;
+  updated_at?: string;
 }
 
 const normalizeTransferCode = (code: string | undefined) => (code ?? '').trim().toUpperCase();
 
-const rowTransferCode = (row: RoomProgressRow) =>
-  normalizeTransferCode(row.user_transfer_code ?? row.transfer_code);
-
 const progressUserKeyFromRow = (row: RoomProgressRow, currentProfile: DeviceProfile | null): string => {
-  if (row.user_id) return row.user_id;
-  const tc = rowTransferCode(row);
-  if (currentProfile && tc && tc === normalizeTransferCode(currentProfile.transferCode)) {
-    return currentProfile.id;
+  const uid = (row.user_id ?? '').trim();
+  if (!uid) return '__unknown__';
+  if (currentProfile) {
+    if (uid === currentProfile.id) return currentProfile.id;
+    if (normalizeTransferCode(uid) === normalizeTransferCode(currentProfile.transferCode)) {
+      return currentProfile.id;
+    }
   }
-  return tc ? `tc:${tc}` : '__unknown__';
+  if (uid.startsWith('u-')) return uid;
+  return `tc:${normalizeTransferCode(uid)}`;
 };
 
 /** Legacy demo seeded 15% for a single reader; normalize to 0% */
@@ -438,14 +437,16 @@ export function Room() {
       if (currentBooks.length === 0) return;
 
       const transferCode = normalizeTransferCode(profile.transferCode);
+      const now = new Date().toISOString();
       const seedRows = currentBooks.map((book) => ({
         room_id: activeRoomId,
         book_id: book.id,
-        user_transfer_code: transferCode,
+        user_id: transferCode,
         progress: clampPercent(book.progressByUser[profile.id] ?? 0),
+        updated_at: now,
       }));
       let seedResult = await client.from(ROOM_PROGRESS_TABLE).upsert(seedRows, {
-        onConflict: 'room_id,book_id,user_transfer_code',
+        onConflict: 'room_id,book_id,user_id',
       });
       if (seedResult.error && /no unique|ON CONFLICT|42P10/i.test(seedResult.error.message)) {
         seedResult = await client.from(ROOM_PROGRESS_TABLE).insert(seedRows);
@@ -509,7 +510,7 @@ export function Room() {
         if (!row || typeof row.book_id !== 'number') return;
         const p = profileRef.current;
         const fullRow = row as RoomProgressRow;
-        if (!fullRow.user_id && !rowTransferCode(fullRow)) return;
+        if (!(fullRow.user_id ?? '').trim()) return;
         const userKey = progressUserKeyFromRow(fullRow, p);
         const progress = clampPercent(Number(row.progress ?? 0));
         setBooks((current) =>
@@ -546,11 +547,12 @@ export function Room() {
     const row = {
       room_id: activeRoomId,
       book_id: bookId,
-      user_transfer_code: normalizeTransferCode(profile.transferCode),
+      user_id: normalizeTransferCode(profile.transferCode),
       progress: clampPercent(progress),
+      updated_at: new Date().toISOString(),
     };
     let result = await client.from(ROOM_PROGRESS_TABLE).upsert(row, {
-      onConflict: 'room_id,book_id,user_transfer_code',
+      onConflict: 'room_id,book_id,user_id',
     });
     if (result.error && /no unique|ON CONFLICT|42P10/i.test(result.error.message)) {
       result = await client.from(ROOM_PROGRESS_TABLE).insert(row);
