@@ -48,17 +48,21 @@ interface RoomProgressRow {
   room_id: string;
   book_id: number;
   progress: number;
-  /** Participant identity in DB (preferred for your schema). */
+  /** Matches Supabase column `user_transfer_code`. */
+  user_transfer_code?: string;
+  /** Older rows / alternate naming. */
   transfer_code?: string;
-  /** Legacy rows if you still have this column. */
   user_id?: string;
 }
 
 const normalizeTransferCode = (code: string | undefined) => (code ?? '').trim().toUpperCase();
 
+const rowTransferCode = (row: RoomProgressRow) =>
+  normalizeTransferCode(row.user_transfer_code ?? row.transfer_code);
+
 const progressUserKeyFromRow = (row: RoomProgressRow, currentProfile: DeviceProfile | null): string => {
   if (row.user_id) return row.user_id;
-  const tc = normalizeTransferCode(row.transfer_code);
+  const tc = rowTransferCode(row);
   if (currentProfile && tc && tc === normalizeTransferCode(currentProfile.transferCode)) {
     return currentProfile.id;
   }
@@ -437,20 +441,23 @@ export function Room() {
       const seedRows = currentBooks.map((book) => ({
         room_id: activeRoomId,
         book_id: book.id,
-        transfer_code: transferCode,
+        user_transfer_code: transferCode,
         progress: clampPercent(book.progressByUser[profile.id] ?? 0),
       }));
-      const { error: seedError } = await client.from(ROOM_PROGRESS_TABLE).upsert(seedRows, {
-        onConflict: 'room_id,book_id,transfer_code',
+      let seedResult = await client.from(ROOM_PROGRESS_TABLE).upsert(seedRows, {
+        onConflict: 'room_id,book_id,user_transfer_code',
       });
-      if (seedError) {
-        console.error('Failed to seed room_progress:', seedError.message);
+      if (seedResult.error && /no unique|ON CONFLICT|42P10/i.test(seedResult.error.message)) {
+        seedResult = await client.from(ROOM_PROGRESS_TABLE).insert(seedRows);
+      }
+      if (seedResult.error) {
+        console.error('Failed to seed room_progress:', seedResult.error.message, seedResult.error);
       }
 
       if (cancelled) return;
       const { data, error } = await client
         .from(ROOM_PROGRESS_TABLE)
-        .select('room_id, book_id, progress, transfer_code, user_id')
+        .select('*')
         .eq('room_id', activeRoomId);
 
       if (cancelled || error || !data) {
@@ -502,7 +509,7 @@ export function Room() {
         if (!row || typeof row.book_id !== 'number') return;
         const p = profileRef.current;
         const fullRow = row as RoomProgressRow;
-        if (!fullRow.user_id && !fullRow.transfer_code) return;
+        if (!fullRow.user_id && !rowTransferCode(fullRow)) return;
         const userKey = progressUserKeyFromRow(fullRow, p);
         const progress = clampPercent(Number(row.progress ?? 0));
         setBooks((current) =>
@@ -539,14 +546,17 @@ export function Room() {
     const row = {
       room_id: activeRoomId,
       book_id: bookId,
-      transfer_code: normalizeTransferCode(profile.transferCode),
+      user_transfer_code: normalizeTransferCode(profile.transferCode),
       progress: clampPercent(progress),
     };
-    const { error } = await client.from(ROOM_PROGRESS_TABLE).upsert(row, {
-      onConflict: 'room_id,book_id,transfer_code',
+    let result = await client.from(ROOM_PROGRESS_TABLE).upsert(row, {
+      onConflict: 'room_id,book_id,user_transfer_code',
     });
-    if (error) {
-      console.error('Failed to update room progress:', error.message);
+    if (result.error && /no unique|ON CONFLICT|42P10/i.test(result.error.message)) {
+      result = await client.from(ROOM_PROGRESS_TABLE).insert(row);
+    }
+    if (result.error) {
+      console.error('Failed to update room progress:', result.error.message, result.error);
     }
   };
 
