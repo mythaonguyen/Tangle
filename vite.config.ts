@@ -5,7 +5,6 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   base: '/Tangle/',
-  // Expose NEXT_PUBLIC_* to the client (same convention as Next.js). Default Vite only exposes VITE_*.
   envPrefix: ['VITE_', 'NEXT_PUBLIC_'],
   plugins: [
     react(),
